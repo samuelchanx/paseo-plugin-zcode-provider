@@ -1,3 +1,31 @@
+# ZCode 3.14.5 の確認（2026-10-11）
+
+[Issue #53](https://github.com/supermomonga/paseo-plugin-zcode-provider/issues/53) の調査。確認済み変更履歴を 3.14.5 に進めるが、ソース基準、最低対応版、管理下ランタイムの固定値は変更しない。**管理下ランタイムは ADR 19 のパッチ済み 3.14.3-paseo.1 を維持する。3.14.5 の互換性を実証したという意味ではない。**
+
+## 上流差分の範囲
+
+- [公式変更履歴](https://zcode.z.ai/en/changelog)：3.14.4 はモデル要求の CAPTCHA 無効化、3.14.5 は手動リセット後の残りリセット回数の表示維持。これは公開された変更説明であり、ソース差分の完全な一覧ではない。
+- `git ls-remote https://github.com/zai-org/ZCode.git 'refs/tags/*' 'refs/heads/*'` で確認した公開タグは `v3.14.3`（`29628c9acdb81b703bbd4080c207a0e7ce5e276e`）と `v3.15.1`（`aac4755666d09fdcd70272fcf063c077a639015f`）。`main` は後者、`feat/ui-plugin` は `662c30bea4e833acaacbfb745a65eb09c23d55f8`（package version 3.14.3）。公開履歴は 3.14.3 から 3.15.1 へ直接進んでおり、3.14.4/3.14.5 のソースを特定できない。
+- したがって **3.14.3 → 3.14.5 の正確なソース差分、パッチ再適用、3.14.5 ランタイムのビルドは未検証**。3.15.1 の差分を代用したり、3.14.3 の package version だけを書き換えて配布したりしない。
+
+## このプロバイダへの影響
+
+- `server/usage.ts` は `usage-stats.getEntitlementSnapshot` から利用率と次回リセット時刻を読む。残りの手動リセット回数を表示せず、手動リセット API も呼ばない。`server/account.ts` にもその操作はない。公開説明の表示修正について、このプロバイダ側の変更は不要と判断した。
+- 対応する UI の参照元は `29628c9` の `packages/ui/src/components/coding-plan-quota-reset/CodingPlanQuotaResetDialog.tsx`。これは UI の所在を確認する資料であり、3.14.5 の修正コミットを特定した証拠ではない。
+- 3.14.4 の CAPTCHA については下記 2026-10-06 の調査を参照。今回もソース版との対応が不明なため、無料枠や認証・モデル要求の動作が不変とは断定しない。最低版の検査を通る外部 override も、3.14.5 の実機互換性を保証しない。
+
+## ADR 19 の維持と検証
+
+- パッチ SHA-256 は `3be78e7a16eca3dcfa2550922d8f97bf9c79e48a4cde3d160c685486c91d3b92`。`git apply --check` は `29628c9` と参考確認した `aac4755` の両方で成功した。パッチは変更していない。後者は **3.15.1 の適用可否だけ**の確認で、効果や3.14.5への適用を保証しない。
+- `npm run check:zcode-source -- /absolute/ZCode-3.14.3` は vendored 97 ファイルを検証した。
+- 現在の公開アーカイブを再取得し、SHA-256 `c51e4547dc804894fd7d62766ab0ce3d759948b8b56cb515528691d75a8e09f9` が `server/runtime/pins.ts` と一致することを確認した。`BUILD-INFO.json` は `modified: true`、上記パッチを記録し、同梱パッチはリポジトリのものとバイト単位で一致した。
+- `PASEO_ZCODE_SUPPRESSED_PLUGINS`、`ZCODE_CUA_PRODUCT_HELPER=0`、`toolDisallowlist` を変更しない。Computer Use / Browser Use を抑止する公開済み成果物を、未パッチ版や由来不明の版へ置き換えない。
+- ローカル Linux / Node.js 24.19.0：typecheck、build、format:check は成功。単体・結合試験は 199/201 成功。`test/e2e-runner.test.mjs` の 2 件は Unix ソケットの `listen EPERM` で失敗した。公開ランタイムの `test:stdio-runtime` は catalog 取得で `NATIVE_PROTOCOL_ERROR` となり、今回の実行では抑止の検査まで到達していない。これを成功扱いしない。既存の 5 プラットフォームおよび実モデルでの成功記録は下記 2026-10-09 のもの。
+
+## 更新を再開する条件
+
+対象版と対応が取れる公開ソースを確保し、Server/Agent・V4・認証・利用量の差分を確認する。ADR 19 のパッチを適用した公式ビルドに対して、模擬公式キャッシュを使う契約試験で両プラグイン・スキル・`mcp__node_repl__js` が消え、他のプラグインが残ることを確認する。5 プラットフォームのリリース検証後、**新しい** `zcode-runtime-v<version>-paseo.<n>` 成果物の公開済み SHA-256 とサイズを固定する。既存のリリースは差し替えない。3.15.1 を採用する場合も、この手順で別途評価する。
+
 # パッチ済みランタイム 3.14.3-paseo.1 の公開と検証（2026-10-09）
 
 ADR 19 のパッチを当てた最初のランタイムを公開し、管理下ランタイムとして固定した。
