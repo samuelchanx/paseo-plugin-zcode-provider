@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest";
 import type { z } from "zod";
 import { AccountService, type SettingsHost } from "./account.js";
 import { AdapterError } from "./errors.js";
-import { encodeModel } from "./mapping.js";
+import { encodeModel, ZCODE_PROVIDER_ID } from "./mapping.js";
 import { createUsageSource, usageReport } from "./usage.js";
 
 const PLAN = "account:zai-individual-coding-plan";
@@ -208,16 +208,16 @@ describe("usage source discovery", () => {
         }),
       );
     expect(await session("codex")).toEqual([]);
-    expect(await session("zcode")).toHaveLength(1);
+    expect(await session(ZCODE_PROVIDER_ID)).toHaveLength(1);
     expect(
       await session(
-        "zcode",
+        ZCODE_PROVIDER_ID,
         encodeModel({ providerId: PLAN, modelId: "GLM-5.3" }),
       ),
     ).toHaveLength(1);
     expect(
       await session(
-        "zcode",
+        ZCODE_PROVIDER_ID,
         encodeModel({ providerId: "zai-api", modelId: "GLM-5.3" }),
       ),
     ).toEqual([]);
