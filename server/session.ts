@@ -15,6 +15,7 @@ import type {
   ConversationRow,
   TurnHeaderRow,
 } from "./vendor/zcode/packages/shared/src/zcode-protocol-v4/rows.js";
+import type { ConversationSnapshot } from "./vendor/zcode/packages/shared/src/zcode-protocol-v4/snapshot.js";
 import { Conversation, conversationCommand } from "./conversation.js";
 import {
   rowTimeline,
@@ -48,6 +49,8 @@ import type {
   NativeTimelineEntry,
 } from "./session-types.js";
 import { AdapterError } from "./errors.js";
+import { goalStartPayload } from "./goal-mode/adapter.js";
+import type { CommandAck } from "./vendor/zcode/packages/shared/src/zcode-protocol-v4/command.js";
 import { diagnosticError, formatDiagnostic } from "./diagnostics.js";
 interface Admission {
   clientMessageId?: string;
@@ -541,6 +544,7 @@ export class ZCodeSession {
       clientMessageId: string;
       delivery?: "auto" | "steer";
       beforeSend?: () => Promise<void>;
+      kind?: "text" | "goal";
     },
   ): Promise<{ turnId: string }> {
     this.assertOpen();
@@ -601,35 +605,50 @@ export class ZCodeSession {
           "Select a ZCode model and reasoning level before sending",
         );
       sent = true;
+      const goal = options?.kind === "goal";
       const ack = await conversationCommand(
         this.bridge,
         this.workspace,
         this.id,
-        "sendText",
-        {
-          text: native.content,
-          attachments,
-          modelSelection: config.modelSelection,
-          mode: config.mode,
-          planEnabled: config.planEnabled === true,
-          toolDisallowlist: [...UNSUPPORTED_TOOLS],
-          requestedDelivery: previous
-            ? attachments.length
-              ? "queue"
-              : "guide"
-            : "startNow",
-        },
+        goal ? "sendGoalCommand" : "sendText",
+        goal
+          ? goalStartPayload(native.content, {
+              modelSelection: config.modelSelection,
+              mode: config.mode,
+              // Goal and plan are mutually exclusive in the runtime; the goal
+              // command itself turns plan off when handed planEnabled: false.
+              planEnabled: false,
+            })
+          : {
+              text: native.content,
+              attachments,
+              modelSelection: config.modelSelection,
+              mode: config.mode,
+              planEnabled: config.planEnabled === true,
+              toolDisallowlist: [...UNSUPPORTED_TOOLS],
+              requestedDelivery: previous
+                ? attachments.length
+                  ? "queue"
+                  : "guide"
+                : "startNow",
+            },
         { commandId },
       );
       if (["failed", "rejected", "stale", "noop"].includes(ack.status))
         throw new AdapterError(
           "NATIVE_INPUT_REJECTED",
-          "ZCode rejected the input",
+          goal && ack.reasonCode
+            ? `ZCode rejected the goal command (${ack.reasonCode})`
+            : "ZCode rejected the input",
         );
       if (
         ack.status !== "accepted" ||
-        ack.result?.type !== "inputAccepted" ||
-        ack.result.inputId !== commandId
+        // The runtime's sendGoalCommand handler applies the target and
+        // deliberately returns no result payload — only the text path mints
+        // an inputAccepted result.
+        (!goal &&
+          (ack.result?.type !== "inputAccepted" ||
+            ack.result.inputId !== commandId))
       )
         throw new AdapterError(
           "NATIVE_PROTOCOL_ERROR",
@@ -689,6 +708,32 @@ export class ZCodeSession {
       "NATIVE_PROTOCOL_ERROR",
       "ZCode configuration remained stale",
     );
+  }
+  /** Official goal-mode actions; the raw ack comes back so guards surface. */
+  async sendGoalAction(type: "pauseGoal" | "resumeGoal"): Promise<CommandAck> {
+    this.assertOpen();
+    // Goal actions are CAS commands: the envelope must carry baseRevision,
+    // and a stale ack proves no mutation — retry at the runtime's revision.
+    let revision = this.state.revision;
+    for (let attempt = 0; attempt < 4; attempt++) {
+      const ack = await conversationCommand(
+        this.bridge,
+        this.workspace,
+        this.id,
+        type,
+        {},
+        { revision },
+      );
+      if (ack.status !== "stale") return ack;
+      revision = ack.revisionAtDecision;
+    }
+    throw new AdapterError(
+      "NATIVE_PROTOCOL_ERROR",
+      `ZCode ${type} remained stale`,
+    );
+  }
+  goalSnapshot(): ConversationSnapshot | undefined {
+    return this.conversation.state;
   }
   async respondToPermission(
     id: string,

@@ -2,6 +2,7 @@ import { afterEach, expect, it, vi } from "vitest";
 import { providerFixture } from "./provider-fixture.js";
 import { completeTurn } from "./fake-host.js";
 import { AdapterError } from "../server/errors.js";
+import type { GoalState } from "../server/vendor/zcode/packages/shared/src/zcode-protocol-v4/snapshot.js";
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => {
   for (const close of cleanups.splice(0).reverse()) await close();
@@ -401,4 +402,133 @@ it("answers native interactions once and ignores responses after their observed 
       content: { answers: { Select: ["native-one"] } },
     },
   });
+});
+it("sends /goal pause as a CAS command and retries a stale ack at the runtime's revision", async () => {
+  const f = await fixture();
+  await f.open();
+  const goal: GoalState = {
+    targetId: "goal-1",
+    objective: "keep the build green",
+    summaryTitle: null,
+    timeUsedSeconds: 3,
+    activeRunStartedAtMs: null,
+    status: "active",
+    iteration: 1,
+    verifications: [],
+    iterations: [],
+  };
+  f.host.state.goal = goal;
+  f.host.state.availability.pauseGoal = { allowed: true };
+  await f.host.emitSnapshot();
+  const request = f.host.request.bind(f.host);
+  let stale = true;
+  f.host.request = async (method, params, schema) => {
+    if (
+      method === "sendConversationCommandV4" &&
+      params?.envelope?.type === "pauseGoal"
+    ) {
+      // The early return below skips FakeBridge.request's own recording.
+      f.host.calls.push({ method, params });
+      if (stale) {
+        stale = false;
+        return schema.parse({
+          commandId: params.envelope.commandId,
+          status: "stale",
+          reasonCode: "revisionMoved",
+          revisionAtDecision: 7,
+        });
+      }
+      f.host.state.goal = { ...goal, status: "paused" };
+      await f.host.emitSnapshot();
+      return schema.parse({
+        commandId: params.envelope.commandId,
+        status: "accepted",
+        revisionAtDecision: 7,
+      });
+    }
+    return request(method, params, schema);
+  };
+  await f.prompt("pause", "/goal pause");
+  const envelopes = f.host.calls
+    .filter(
+      (c) =>
+        c.method === "sendConversationCommandV4" &&
+        c.params?.envelope?.type === "pauseGoal",
+    )
+    .map((c) => c.params.envelope);
+  expect(envelopes).toHaveLength(2);
+  expect(envelopes[0].baseRevision).toBe(0);
+  expect(envelopes[1].baseRevision).toBe(7);
+  expect(
+    f.events.some(
+      (e) =>
+        e.type === "timeline.item" &&
+        (e.item as { text?: string }).text === "Official goal paused.",
+    ),
+  ).toBe(true);
+});
+it("sends /goal resume as a CAS command and retries a stale ack at the runtime's revision", async () => {
+  const f = await fixture();
+  await f.open();
+  const goal: GoalState = {
+    targetId: "goal-1",
+    objective: "keep the build green",
+    summaryTitle: null,
+    timeUsedSeconds: 30,
+    activeRunStartedAtMs: null,
+    status: "paused",
+    iteration: 1,
+    verifications: [],
+    iterations: [],
+  };
+  f.host.state.goal = goal;
+  f.host.state.availability.resumeGoal = { allowed: true };
+  await f.host.emitSnapshot();
+  const request = f.host.request.bind(f.host);
+  let stale = true;
+  f.host.request = async (method, params, schema) => {
+    if (
+      method === "sendConversationCommandV4" &&
+      params?.envelope?.type === "resumeGoal"
+    ) {
+      // The early return below skips FakeBridge.request's own recording.
+      f.host.calls.push({ method, params });
+      if (stale) {
+        stale = false;
+        return schema.parse({
+          commandId: params.envelope.commandId,
+          status: "stale",
+          reasonCode: "revisionMoved",
+          revisionAtDecision: 9,
+        });
+      }
+      f.host.state.goal = { ...goal, status: "active" };
+      await f.host.emitSnapshot();
+      return schema.parse({
+        commandId: params.envelope.commandId,
+        status: "accepted",
+        revisionAtDecision: 9,
+      });
+    }
+    return request(method, params, schema);
+  };
+  await f.prompt("resume", "/goal resume");
+  const envelopes = f.host.calls
+    .filter(
+      (c) =>
+        c.method === "sendConversationCommandV4" &&
+        c.params?.envelope?.type === "resumeGoal",
+    )
+    .map((c) => c.params.envelope);
+  expect(envelopes).toHaveLength(2);
+  expect(envelopes[0].baseRevision).toBe(0);
+  expect(envelopes[1].baseRevision).toBe(9);
+  expect(
+    f.events.some(
+      (e) =>
+        e.type === "timeline.item" &&
+        (e.item as { text?: string }).text ===
+          "Official goal resumed — the loop continues below.",
+    ),
+  ).toBe(true);
 });

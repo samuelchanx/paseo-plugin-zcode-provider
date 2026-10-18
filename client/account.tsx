@@ -69,7 +69,7 @@ const canCopy = typeof copyText === "function";
 function refreshCatalog(serverId: string): void {
   if (typeof getPaseoClient !== "function") return;
   getPaseoClient(serverId)
-    .providers.refresh({ providers: ["zcode"] })
+    .providers.refresh({ providers: ["zcode-native"] })
     .catch(() => {});
 }
 

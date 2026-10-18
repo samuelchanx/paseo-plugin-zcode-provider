@@ -20,6 +20,8 @@ import {
   type PersistenceData,
 } from "./persistence.js";
 import { homedir } from "node:os";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { z } from "zod";
 import {
   assertRuntimeSupported,
@@ -51,6 +53,64 @@ import {
 import { SessionSnapshotSchema, SessionListSchema } from "./host/schemas.js";
 import { TimelineSnapshots } from "./timeline.js";
 import type { NativeSessionEvent } from "./session-types.js";
+import type { ProviderMcpServerConfig } from "@getpaseo/plugin/server/provider";
+import {
+  GoalLoopDriver,
+  runDriverTurn,
+  statusTextOf,
+  type GoalLoopHost,
+} from "./goal-loop/driver.js";
+import { clearGoalState, readGoalState } from "./goal-loop/state.js";
+import {
+  formatGoalStatus,
+  GoalModeAdapter,
+  GoalModeUnavailableError,
+  routeGoalCommand,
+} from "./goal-mode/adapter.js";
+
+// The protocol app-server loads no MCP stores on its own — servers only reach a
+// session through createSession params. Merge the user's CLI-configured servers
+// (~/.zcode/cli/config.json mcp.servers) so they apply without per-agent setup.
+type ZcodeConfigMcpEntry = {
+  type?: string;
+  command?: string;
+  args?: string[];
+  env?: Record<string, string>;
+  url?: string;
+  headers?: Record<string, string>;
+  enabled?: boolean;
+};
+
+function withZcodeConfigMcpServers(
+  servers: Record<string, ProviderMcpServerConfig> | undefined,
+): Record<string, ProviderMcpServerConfig> {
+  const merged: Record<string, ProviderMcpServerConfig> = { ...servers };
+  try {
+    const raw = JSON.parse(
+      readFileSync(join(homedir(), ".zcode", "cli", "config.json"), "utf8"),
+    ) as { mcp?: { servers?: Record<string, ZcodeConfigMcpEntry> } };
+    for (const [name, entry] of Object.entries(raw.mcp?.servers ?? {})) {
+      if (entry?.enabled === false || merged[name] !== undefined) continue;
+      if (typeof entry?.command === "string" && entry.command.trim() !== "") {
+        merged[name] = {
+          type: "stdio",
+          command: entry.command,
+          ...(entry.args ? { args: entry.args } : {}),
+          ...(entry.env ? { env: entry.env } : {}),
+        };
+      } else if (typeof entry?.url === "string" && entry.url.trim() !== "") {
+        merged[name] = {
+          type: "http",
+          url: entry.url,
+          ...(entry.headers ? { headers: entry.headers } : {}),
+        };
+      }
+    }
+  } catch {
+    // No readable CLI config: pass through Paseo-provided servers only.
+  }
+  return merged;
+}
 
 export const CAPABILITIES = [
   "prompt.message",
@@ -110,6 +170,32 @@ interface SessionEntry {
   messages: Map<string, boolean>;
   inputGeneration: number;
   queue: Promise<void>;
+  cwd: string;
+  /** Sticky: the runtime refused the official goal command once — future /goal starts go straight to the plugin loop. */
+  goalModeBlocked: boolean;
+}
+
+type SessionPromptRequest = Extract<ProviderInput, { type: "session.prompt" }>["prompt"];
+
+type GoalCommand = { label: "goal" | "auto"; arg: string };
+
+let goalNoteSeq = 0;
+
+/** Extract /goal and /auto (command or leading-slash text) prompts. */
+function goalCommandOf(prompt: SessionPromptRequest): GoalCommand | null {
+  const p = prompt.input;
+  if (p.type === "command") {
+    if (p.name === "goal" || p.name === "auto")
+      return { label: p.name, arg: p.arguments.trim() };
+    return null;
+  }
+  if (p.type === "message" && p.content.length === 1) {
+    const part = p.content[0];
+    if (part?.type !== "text") return null;
+    const m = /^\/(goal|auto)(?:\s+([\s\S]+))?$/.exec(part.text.trim());
+    if (m) return { label: m[1] as GoalCommand["label"], arg: (m[2] ?? "").trim() };
+  }
+  return null;
 }
 
 export function createZCodeProvider(
@@ -118,8 +204,8 @@ export function createZCodeProvider(
   status: ProviderRegistration["status"] = createRuntimeStatus(),
 ): ProviderRegistration {
   return {
-    id: "zcode",
-    label: "ZCode",
+    id: "zcode-native",
+    label: "ZCode Native",
     description:
       "ZCode workspace agent with native planning, tools, and model selection",
     icon: "icon.svg",
@@ -145,6 +231,7 @@ export class ZCodeConnection implements ProviderConnection {
   private readonly opening = new Set<string>();
   private readonly jobs = new Set<Promise<void>>();
   private readonly hosts = new Set<HostBridge>();
+  private readonly goalLoops = new Map<string, GoalLoopDriver>();
   private readonly abort = new AbortController();
   private closed = false;
   private closing?: Promise<void>;
@@ -373,6 +460,13 @@ export class ZCodeConnection implements ProviderConnection {
     switch (input.type) {
       case "session.prompt": {
         const prompt = input.prompt.input;
+        // /goal and /auto bypass the native text path entirely: they drive the
+        // bridge-ported goal loop instead of reaching the model as raw text.
+        const goal = goalCommandOf(input.prompt);
+        if (goal) {
+          await this.handleGoalCommand(input, entry, goal.label, goal.arg);
+          return;
+        }
         if (input.prompt.clearPendingPermissions)
           throw new AdapterError(
             "INTERACTION_UNSUPPORTED",
@@ -561,7 +655,7 @@ export class ZCodeConnection implements ProviderConnection {
                     }
                   : {}),
               }),
-          mcpServers: mapMcpServers(config.mcpServers),
+          mcpServers: mapMcpServers(withZcodeConfigMcpServers(config.mcpServers)),
         },
         SessionSnapshotSchema,
         60000,
@@ -613,6 +707,8 @@ export class ZCodeConnection implements ProviderConnection {
         messages: new Map(),
         inputGeneration: 0,
         queue: Promise.resolve(),
+        cwd,
+        goalModeBlocked: false,
       };
       this.sessions.set(input.sessionId, entry);
       this.emit({
@@ -669,6 +765,23 @@ export class ZCodeConnection implements ProviderConnection {
   }
 
   private emitConfig(id: string, entry: SessionEntry): void {
+    const nativeCommands = entry.native.listCommands();
+    const commands = nativeCommands.some((c) => c.name === "goal")
+      ? nativeCommands
+      : [
+          ...nativeCommands,
+          {
+            name: "goal",
+            description:
+              "Autonomous goal loop on ZCode's official engine (plugin loop as fallback): decompose → rounds → verification (subcommands: status, pause, resume, stop)",
+            argumentHint: "<objective> | status | pause | resume | stop",
+          },
+          {
+            name: "auto",
+            description: "Alias of /goal",
+            argumentHint: "<objective> | status | pause | resume | stop",
+          },
+        ];
     this.emit({
       type: "session.config",
       sessionId: id,
@@ -677,8 +790,234 @@ export class ZCodeConnection implements ProviderConnection {
     this.emit({
       type: "session.commands",
       sessionId: id,
-      commands: entry.native.listCommands(),
+      commands,
     });
+  }
+
+  // ---------- goal loop (/goal, /auto) ----------
+
+  private goalNote(sessionId: string, message: string): void {
+    this.emit({
+      type: "timeline.item",
+      sessionId,
+      item: {
+        id: `zcode:goal-note-${++goalNoteSeq}`,
+        type: "assistant_message",
+        text: message,
+      },
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  private async handleGoalCommand(
+    input: Extract<ProviderInput, { type: "session.prompt" }>,
+    entry: SessionEntry,
+    label: "goal" | "auto",
+    arg: string,
+  ): Promise<void> {
+    const sessionId = input.sessionId;
+    const clientMessageId = input.prompt.clientMessageId;
+    // Control-command feedback renders as a synthetic assistant message (the
+    // bridge did the same over ACP): notifications are not reliably persisted.
+    const note = (message: string): void =>
+      this.goalNote(sessionId, message);
+    // Completes a non-loop-start command: optional note + prompt_result.
+    const complete = (message?: string): void => {
+      if (message) note(message);
+      if (clientMessageId) {
+        entry.messages.set(clientMessageId, true);
+        this.emit({
+          type: "session.prompt_result",
+          sessionId,
+          clientMessageId,
+          result: { type: "completed" },
+        });
+      }
+    };
+
+    const live = this.goalLoops.get(entry.native.id);
+    const sub = arg.split(/\s+/)[0]?.toLowerCase() ?? "";
+    // Official ZCode goal mode: the runtime owns the loop engine and the goal
+    // state in the conversation snapshot; this adapter is the only protocol
+    // seam. Starts go through startTurn (kind "goal") so the Paseo run
+    // lifecycle tracks the starting turn — the stop button can then interrupt
+    // it, which the runtime turns into a goal pause.
+    const adapter = new GoalModeAdapter({
+      sendGoal: async (payload) => {
+        try {
+          await entry.native.startTurn(String(payload.text ?? ""), {
+            clientMessageId,
+            beforeSend: async () => {
+              if (!entry.submitted) {
+                await this.persistenceStore.save(
+                  entry.persistence,
+                  entry.native.id,
+                );
+                entry.submitted = true;
+              }
+            },
+            kind: "goal",
+          });
+          return { engaged: true };
+        } catch (e) {
+          if (!(e instanceof AdapterError)) throw e;
+          if (e.code !== "NATIVE_INPUT_REJECTED") throw e;
+          // Only a goal-specific refusal proves the runtime rejects official
+          // goal mode (sticky fallback); stale/failed acks are transient and
+          // must not block future official attempts.
+          const goalRefusal = /^ZCode rejected the goal command \((.+)\)$/.exec(
+            e.message,
+          );
+          return {
+            engaged: false,
+            reasonCode: goalRefusal?.[1] ?? "transient",
+          };
+        }
+      },
+      sendAction: (type) => entry.native.sendGoalAction(type),
+      snapshot: () => entry.native.goalSnapshot(),
+    });
+    const route = routeGoalCommand(sub, {
+      officialGoal: adapter.state(),
+      officialUsable: !entry.goalModeBlocked,
+      driverRunning: live?.running === true,
+      driverStateSaved: Boolean(readGoalState(entry.cwd, entry.native.id)),
+    });
+    switch (route.kind) {
+      case "official-status": {
+        const view = adapter.state();
+        complete(view ? formatGoalStatus(view) : `No ${label} loop for this session.`);
+        return;
+      }
+      case "official-pause":
+      case "official-resume":
+      case "official-stop":
+        try {
+          if (route.kind === "official-pause")
+            complete(await adapter.pause());
+          else if (route.kind === "official-resume")
+            complete(await adapter.resume());
+          else
+            // Official goals cannot be cleared, only paused or superseded.
+            complete(
+              `${await adapter.pause()}\nOfficial goals can't be cleared — start a new ${label} with a fresh objective to supersede this one.`,
+            );
+        } catch (e) {
+          complete(
+            `goal control failed: ${e instanceof Error ? e.message : String(e)}`,
+          );
+        }
+        return;
+      case "driver-status":
+        if (live) complete(live.statusText());
+        else {
+          const prior = readGoalState(entry.cwd, entry.native.id);
+          complete(prior ? statusTextOf(prior) : `No ${label} loop for this session.`);
+        }
+        return;
+      case "driver-pause":
+        if (live?.running) {
+          live.pause();
+          complete(`${label} pause requested — takes effect at the round boundary`);
+        } else complete(`No running ${label} loop to pause.`);
+        return;
+      case "driver-resume":
+        if (live) {
+          live.resume();
+          complete(`${label} resume — pause/stop flags cleared, loop continues`);
+          return;
+        }
+        try {
+          await this.startGoalLoop(sessionId, entry, "", { resume: true });
+        } catch (e) {
+          complete(
+            `resume failed: ${e instanceof Error ? e.message : String(e)}`,
+          );
+          return;
+        }
+        complete(`${label} loop resumed — running detached; rounds stream below.`);
+        return;
+      case "driver-stop":
+        if (live?.running) {
+          live.stop();
+          complete(`${label} stop requested — ends at the round boundary`);
+        } else {
+          clearGoalState(entry.cwd, entry.native.id);
+          complete(`No running ${label} loop — saved state cleared.`);
+        }
+        return;
+      case "start-official":
+        if (entry.native.hasActiveTurn()) {
+          complete(
+            "ZCode is busy — start the goal once the current turn finishes.",
+          );
+          return;
+        }
+        try {
+          await adapter.startObjective(arg, {});
+        } catch (e) {
+          if (e instanceof GoalModeUnavailableError) {
+            if (e.reasonCode !== "transient") entry.goalModeBlocked = true;
+            note(
+              `Official goal mode unavailable (${e.reasonCode}) — using the plugin goal loop.`,
+            );
+            await this.startGoalLoop(sessionId, entry, arg);
+            complete();
+            return;
+          }
+          complete(
+            `goal failed to start: ${e instanceof Error ? e.message : String(e)}`,
+          );
+          return;
+        }
+        note(
+          "Official goal engaged — the ZCode runtime drives the loop; iterations and verifications stream below.",
+        );
+        return;
+      case "start-driver":
+        try {
+          await this.startGoalLoop(sessionId, entry, arg);
+        } catch (e) {
+          complete(
+            `goal loop failed to start: ${e instanceof Error ? e.message : String(e)}`,
+          );
+          return;
+        }
+        // Complete immediately — Paseo's run-start gate times a prompt out
+        // after 60 s without a prompt_result. The loop runs detached from
+        // here; its rounds are real native turns that stream into the timeline.
+        complete();
+        return;
+      case "reject": {
+        const extra = live?.running ? ` — ${live.statusText()}` : "";
+        complete(`${route.reason}${extra}`);
+        return;
+      }
+      case "note":
+        complete(route.message);
+        return;
+    }
+  }
+
+  private async startGoalLoop(
+    sessionId: string,
+    entry: SessionEntry,
+    objective: string,
+    opts: { resume?: boolean } = {},
+  ): Promise<void> {
+    const native = entry.native;
+    // The /goal prompt bypasses startTurn's beforeSend, so the logical→native
+    // mapping must be saved here — without it a daemon/plugin restart loses
+    // the session resume and orphans the goal state on disk.
+    await this.persistenceStore.save(entry.persistence, native.id);
+    const host: GoalLoopHost = {
+      cwd: entry.cwd,
+      nativeSessionId: native.id,
+      runTurn: (prompt) => runDriverTurn(native, prompt),
+      announce: (message) => this.goalNote(sessionId, message),
+    };
+    const driver = GoalLoopDriver.start(host, objective, { resume: opts.resume });
+    this.goalLoops.set(native.id, driver);
   }
 
   private accept(
@@ -794,6 +1133,11 @@ export class ZCodeConnection implements ProviderConnection {
   private async closeSession(id: string): Promise<void> {
     const entry = this.requireSession(id);
     this.sessions.delete(id);
+    const driver = this.goalLoops.get(entry.native.id);
+    if (driver) {
+      this.goalLoops.delete(entry.native.id);
+      driver.stop();
+    }
     try {
       await entry.native.close();
     } finally {

@@ -11,7 +11,7 @@ import type {
 import { AdapterError } from "./errors.js";
 import type { ModelOption, ModelSelection } from "./host/schemas.js";
 
-export const ZCODE_PROVIDER_ID = "zcode";
+export const ZCODE_PROVIDER_ID = "zcode-native";
 export const ZCODE_MODES: ProviderMode[] = [
   {
     id: "build",
