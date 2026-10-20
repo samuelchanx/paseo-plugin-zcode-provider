@@ -68,6 +68,11 @@ import {
   GoalModeUnavailableError,
   routeGoalCommand,
 } from "./goal-mode/adapter.js";
+import {
+  listSkillCommands,
+  mergeSkillCommands,
+  type SkillCommand,
+} from "./skill-commands.js";
 
 // The protocol app-server loads no MCP stores on its own — servers only reach a
 // session through createSession params. Merge the user's CLI-configured servers
@@ -174,6 +179,8 @@ interface SessionEntry {
   cwd: string;
   /** Sticky: the runtime refused the official goal command once — future /goal starts go straight to the plugin loop. */
   goalModeBlocked: boolean;
+  /** User/project skills, discovered async after open and merged into the slash list. */
+  skills: SkillCommand[];
 }
 
 type SessionPromptRequest = Extract<ProviderInput, { type: "session.prompt" }>["prompt"];
@@ -488,9 +495,8 @@ export class ZCodeConnection implements ProviderConnection {
           );
         if (
           prompt.type === "command" &&
-          !(await entry.native.listCommands()).some(
-            (command) => command.name === prompt.name,
-          )
+          !entry.native.listCommands().some((command) => command.name === prompt.name) &&
+          !entry.skills.some((skill) => skill.name === prompt.name)
         )
           throw new Error("Unknown ZCode command");
         // ZCode desktop implements /plan as setMode plus an optional task.
@@ -694,6 +700,7 @@ export class ZCodeConnection implements ProviderConnection {
         queue: Promise.resolve(),
         cwd,
         goalModeBlocked: false,
+        skills: [],
       };
       this.sessions.set(input.sessionId, entry);
       this.emit({
@@ -707,6 +714,16 @@ export class ZCodeConnection implements ProviderConnection {
         title: config.title ?? snapshot.session.title,
       });
       this.emitConfig(input.sessionId, entry);
+      // Skills load async: refresh the command list once discovery lands.
+      void listSkillCommands(cwd).then(
+        (skills) => {
+          if (this.sessions.get(input.sessionId) !== entry || !skills.length)
+            return;
+          entry.skills = skills;
+          this.emitConfig(input.sessionId, entry);
+        },
+        () => {},
+      );
       if (input.history === "replay")
         for (const { item, timestamp } of native.historyItems())
           this.emit({
@@ -767,6 +784,17 @@ export class ZCodeConnection implements ProviderConnection {
             argumentHint: "<objective> | status | pause | resume | stop",
           },
         ];
+    // The runtime's protocol command list omits skills entirely (they are a
+    // TUI-side surface), so the provider reports them itself — otherwise
+    // Paseo's slash autocomplete never shows /to-prd & co.
+    const withSkills = [
+      ...commands,
+      ...mergeSkillCommands(commands, [], entry.skills).map((skill) => ({
+        name: skill.name,
+        description: skill.description || "ZCode skill",
+        argumentHint: `/${skill.name}`,
+      })),
+    ];
     this.emit({
       type: "session.config",
       sessionId: id,
@@ -775,7 +803,7 @@ export class ZCodeConnection implements ProviderConnection {
     this.emit({
       type: "session.commands",
       sessionId: id,
-      commands,
+      commands: withSkills,
     });
   }
 
