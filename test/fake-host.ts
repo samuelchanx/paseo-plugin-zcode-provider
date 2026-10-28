@@ -81,6 +81,8 @@ export class FakeBridge implements HostBridge {
   failAdmission?: "rejected" | "unknown";
   /** The reason a rejected admission carries, such as 3.18's modelUnavailable. */
   rejectionReason?: string;
+  /** Simulates a native session the runtime can no longer restore. */
+  failResume?: boolean;
   afterAdmit?: () => Promise<void>;
   private failures = new Set<(e: AdapterError) => void>();
   constructor(public current: SessionSnapshot) {
@@ -496,6 +498,11 @@ export class FakeBridge implements HostBridge {
         break;
       case "createSession":
       case "resumeSession": {
+        if (method === "resumeSession" && this.failResume)
+          throw new AdapterError(
+            "SESSION_NOT_FOUND",
+            "test: native session is gone",
+          );
         if (params.model) {
           this.state.config.modelSelection = {
             ...params.model,

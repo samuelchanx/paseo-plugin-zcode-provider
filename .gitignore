@@ -5,3 +5,7 @@ coverage/
 server/build-info.ts
 /mise.local.toml
 /libs/zcode
+
+# Local harness scratch
+.zcode/
+.scratch/
