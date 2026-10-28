@@ -1,7 +1,11 @@
 import { afterEach, expect, it, vi } from "vitest";
+import { rm } from "node:fs/promises";
+import { join } from "node:path";
 import { providerFixture } from "./provider-fixture.js";
-import { completeTurn } from "./fake-host.js";
+import { completeTurn, FakeBridge, snapshot } from "./fake-host.js";
 import { AdapterError } from "../server/errors.js";
+import { createZCodeProvider, CAPABILITIES } from "../server/provider.js";
+import type { ProviderEvent } from "@getpaseo/plugin/server/provider";
 import type { GoalState } from "../server/vendor/zcode/packages/shared/src/zcode-protocol-v4/snapshot.js";
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => {
@@ -613,6 +617,7 @@ it("offers guarded mode only on ZCode 3.15.1 and later", async () => {
       (c) => c.params?.envelope?.type === "switchCollaborationMode",
     )?.params.envelope.payload,
   ).toEqual({ mode: "guarded" });
+});
 
 it("sends /goal pause as a CAS command and retries a stale ack at the runtime's revision", async () => {
   const f = await fixture();
@@ -742,4 +747,167 @@ it("sends /goal resume as a CAS command and retries a stale ack at the runtime's
           "Official goal resumed — the loop continues below.",
     ),
   ).toBe(true);
+});
+
+// ── Self-heal resume after process death ─────────────────────────────────
+
+type Fixture = Awaited<ReturnType<typeof fixture>>;
+
+async function freshPeer(f: Fixture) {
+  const host = new FakeBridge(snapshot(f.cwd));
+  const connection = await createZCodeProvider(
+    async () => host,
+    f.store,
+  ).connect({ versions: [1], capabilities: CAPABILITIES });
+  cleanups.push(() => connection.close());
+  const events: ProviderEvent[] = [];
+  connection.onEvent((e) => events.push(e));
+  const wait = async (predicate: (e: ProviderEvent) => boolean) => {
+    for (let i = 0; i < 300; i++) {
+      const event = events.find(predicate);
+      if (event) return event;
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    throw new Error(
+      `Missing peer event; ${events.map((e) => e.type).join(", ")}`,
+    );
+  };
+  const prompt = (id: string) =>
+    connection.send({
+      type: "session.prompt",
+      sessionId: "public",
+      prompt: {
+        clientMessageId: id,
+        input: { type: "message", content: [{ type: "text", text: "again" }] },
+        delivery: "auto",
+      },
+    });
+  return { host, connection, events, wait, prompt };
+}
+
+it("writes a resume index on open and removes it on close", async () => {
+  const f = await fixture();
+  await f.open();
+  expect(await f.store.loadIndex("public")).toMatchObject({
+    version: 1,
+    handle: { kind: "logical" },
+    config: { cwd: f.cwd },
+  });
+  await f.send({
+    type: "session.close",
+    sessionId: "public",
+    requestId: "close",
+  });
+  await f.wait((e) => e.type === "session.closed");
+  expect(await f.store.loadIndex("public")).toBeUndefined();
+});
+
+it("keeps the resume index when the connection dies", async () => {
+  const f = await fixture();
+  await f.open();
+  await f.prompt();
+  await f.connection.close();
+  expect(await f.store.loadIndex("public")).toBeDefined();
+});
+
+it("self-heals a killed session on the next prompt", async () => {
+  const f = await fixture();
+  await f.open();
+  f.host.afterAdmit = () => completeTurn(f.host);
+  await f.prompt();
+  await f.connection.close();
+  const peer = await freshPeer(f);
+  peer.host.afterAdmit = () => completeTurn(peer.host);
+  await peer.prompt("m2");
+  await peer.wait((e) => e.type === "session.turn" && e.state === "completed");
+  expect(
+    peer.host.calls.some(
+      (c) =>
+        c.method === "resumeSession" && c.params?.sessionId === "session-1",
+    ),
+  ).toBe(true);
+  expect(
+    peer.events.some(
+      (e) =>
+        e.type === "session.prompt_result" &&
+        e.clientMessageId === "m2" &&
+        e.result.type === "failed",
+    ),
+  ).toBe(false);
+  // Exactly one admission result for the healed prompt — no duplicates.
+  expect(
+    peer.events.filter(
+      (e) => e.type === "session.prompt_result" && e.clientMessageId === "m2",
+    ),
+  ).toHaveLength(1);
+});
+
+it("falls back to a fresh session with a warning when resume is refused", async () => {
+  const f = await fixture();
+  await f.open();
+  f.host.afterAdmit = () => completeTurn(f.host);
+  await f.prompt();
+  const original = await f.store.loadIndex("public");
+  await f.connection.close();
+  const peer = await freshPeer(f);
+  peer.host.failResume = true;
+  peer.host.afterAdmit = () => completeTurn(peer.host);
+  await peer.prompt("m2");
+  await peer.wait((e) => e.type === "session.turn" && e.state === "completed");
+  expect(peer.host.calls.some((c) => c.method === "resumeSession")).toBe(true);
+  expect(peer.host.calls.some((c) => c.method === "createSession")).toBe(true);
+  const noticeAt = peer.events.findIndex((e) => e.type === "session.notice");
+  const turnAt = peer.events.findIndex(
+    (e) => e.type === "session.turn" && e.state === "completed",
+  );
+  expect(noticeAt).toBeGreaterThanOrEqual(0);
+  expect(noticeAt).toBeLessThan(turnAt);
+  const notice = peer.events[noticeAt];
+  expect(notice).toMatchObject({
+    sessionId: "public",
+    notice: { severity: "warning" },
+  });
+  if (notice?.type === "session.notice")
+    expect(notice.notice.description).toContain("session-1");
+  // The index must point at the replacement conversation so a second
+  // process death resumes the fallback session instead of falling back again.
+  const healed = await f.store.loadIndex("public");
+  expect(healed?.handle).toMatchObject({ kind: "logical" });
+  expect(healed?.handle).not.toEqual(original?.handle);
+  expect(
+    peer.events.some(
+      (e) =>
+        e.type === "session.prompt_result" &&
+        e.clientMessageId === "m2" &&
+        e.result.type === "failed",
+    ),
+  ).toBe(false);
+});
+
+it("still fails for sessions without a resume index", async () => {
+  const f = await fixture();
+  const peer = await freshPeer(f);
+  await expect(peer.prompt("m2")).rejects.toThrow(/Unknown ZCode session/);
+  expect(peer.host.calls.some((c) => c.method === "resumeSession")).toBe(false);
+});
+
+it("surfaces workspace errors instead of healing when the workspace is gone", async () => {
+  const f = await fixture();
+  await f.open();
+  f.host.afterAdmit = () => completeTurn(f.host);
+  await f.prompt();
+  await f.connection.close();
+  const record = await f.store.loadIndex("public");
+  await f.store.saveIndex("public", {
+    version: 1,
+    handle: record!.handle,
+    config: { ...record!.config, cwd: join(f.cwd, "vanished") },
+  });
+  const peer = await freshPeer(f);
+  await expect(peer.prompt("m2")).rejects.toThrow();
+  expect(
+    peer.host.calls.some(
+      (c) => c.method === "resumeSession" || c.method === "createSession",
+    ),
+  ).toBe(false);
 });

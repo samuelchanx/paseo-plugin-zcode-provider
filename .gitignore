@@ -8,3 +8,4 @@ server/build-info.ts
 
 # Local harness scratch
 .zcode/
+.scratch/

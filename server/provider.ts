@@ -54,7 +54,10 @@ import {
 import { SessionSnapshotSchema, SessionListSchema } from "./host/schemas.js";
 import { TimelineSnapshots } from "./timeline.js";
 import type { NativeSessionEvent } from "./session-types.js";
-import type { ProviderMcpServerConfig } from "@getpaseo/plugin/server/provider";
+import type {
+  ProviderMcpServerConfig,
+  ProviderSessionConfig,
+} from "@getpaseo/plugin/server/provider";
 import {
   GoalLoopDriver,
   runDriverTurn,
@@ -183,11 +186,22 @@ interface SessionEntry {
   skills: SkillCommand[];
 }
 
-type SessionPromptRequest = Extract<ProviderInput, { type: "session.prompt" }>["prompt"];
+interface AttachedNative {
+  host: HostBridge;
+  native: ZCodeSession;
+  snapshot: z.output<typeof SessionSnapshotSchema>;
+}
+
+type SessionPromptRequest = Extract<
+  ProviderInput,
+  { type: "session.prompt" }
+>["prompt"];
 
 type GoalCommand = { label: "goal" | "auto"; arg: string };
 
 let goalNoteSeq = 0;
+
+let healNoticeSeq = 0;
 
 /** Extract /goal and /auto (command or leading-slash text) prompts. */
 function goalCommandOf(prompt: SessionPromptRequest): GoalCommand | null {
@@ -201,7 +215,8 @@ function goalCommandOf(prompt: SessionPromptRequest): GoalCommand | null {
     const part = p.content[0];
     if (part?.type !== "text") return null;
     const m = /^\/(goal|auto)(?:\s+([\s\S]+))?$/.exec(part.text.trim());
-    if (m) return { label: m[1] as GoalCommand["label"], arg: (m[2] ?? "").trim() };
+    if (m)
+      return { label: m[1] as GoalCommand["label"], arg: (m[2] ?? "").trim() };
   }
   return null;
 }
@@ -240,6 +255,8 @@ export class ZCodeConnection implements ProviderConnection {
   private readonly jobs = new Set<Promise<void>>();
   private readonly hosts = new Set<HostBridge>();
   private readonly goalLoops = new Map<string, GoalLoopDriver>();
+  /** In-flight dispatch-miss self-heals, keyed by public session id. */
+  private readonly healing = new Map<string, Promise<boolean>>();
   private readonly abort = new AbortController();
   private closed = false;
   private closing?: Promise<void>;
@@ -267,6 +284,22 @@ export class ZCodeConnection implements ProviderConnection {
       )
         throw new Error("Duplicate ZCode session ID");
       this.opening.add(input.sessionId);
+    }
+    if (
+      input.type === "session.prompt" ||
+      input.type === "session.configure" ||
+      input.type === "session.interrupt"
+    ) {
+      // Dispatch-miss self-heal: the adapter process that owned this session
+      // died (reaped, crashed, daemon restart). Rebuild it from the resume
+      // index so history stays continuable; without an index (never opened
+      // here, or properly closed) keep the historical error.
+      if (
+        !this.sessions.has(input.sessionId) &&
+        !this.opening.has(input.sessionId) &&
+        !(await this.healSession(input.sessionId))
+      )
+        throw new AdapterError("SESSION_NOT_FOUND", "Unknown ZCode session");
     }
     if (input.type === "session.prompt") {
       const entry = this.requireSession(input.sessionId);
@@ -495,7 +528,9 @@ export class ZCodeConnection implements ProviderConnection {
           );
         if (
           prompt.type === "command" &&
-          !entry.native.listCommands().some((command) => command.name === prompt.name) &&
+          !entry.native
+            .listCommands()
+            .some((command) => command.name === prompt.name) &&
           !entry.skills.some((skill) => skill.name === prompt.name)
         )
           throw new Error("Unknown ZCode command");
@@ -579,6 +614,7 @@ export class ZCodeConnection implements ProviderConnection {
         return;
       case "session.close":
         await this.closeSession(input.sessionId);
+        await this.persistenceStore.deleteIndex(input.sessionId);
         this.emit({ type: "session.closed", sessionId: input.sessionId });
         return;
     }
@@ -590,7 +626,6 @@ export class ZCodeConnection implements ProviderConnection {
   ): Promise<void> {
     const config = input.config;
     optionsSchema.parse(config.providerOptions ?? {});
-    const settings = settingsSchema.parse(config.settings);
     requireConfigurableMode(config.mode);
     if (config.systemPrompt?.trim())
       throw new AdapterError(
@@ -612,6 +647,93 @@ export class ZCodeConnection implements ProviderConnection {
         "ZCode persistence belongs to another workspace",
       );
     const nativeId = await this.persistenceStore.resolve(persistence);
+    const { host, native, snapshot } = await this.attachNative(
+      persistence,
+      config,
+      nativeId,
+    );
+    try {
+      if (this.closed) throw new Error("ZCode connection is closed");
+      const entry = this.registerSession(input.sessionId, {
+        native,
+        host,
+        persistence,
+        cwd,
+        submitted: nativeId !== undefined,
+      });
+      try {
+        await this.persistenceStore.saveIndex(input.sessionId, {
+          version: 1,
+          handle: persistence,
+          config: {
+            cwd,
+            env: { ...config.env },
+            ...(config.model === undefined ? {} : { model: config.model }),
+            ...(config.thinkingOption === undefined
+              ? {}
+              : { thinkingOption: config.thinkingOption }),
+            mcpServers: { ...config.mcpServers },
+          },
+        });
+      } catch (error) {
+        // Best-effort: a failed index write must not fail the open itself.
+        // The session just stays un-resumable after adapter death, which is
+        // the pre-self-heal behavior anyway (ADR-0020).
+        logger.error("zcode.provider.resume_index_write_failed", error);
+      }
+      this.emit({
+        type: "session.opened",
+        requestId: input.requestId,
+        sessionId: input.sessionId,
+        capabilities: this.capabilities,
+        restoration: "core",
+        persistence: persistenceHandle(persistence),
+        cwd,
+        title: config.title ?? snapshot.session.title,
+      });
+      this.emitConfig(input.sessionId, entry);
+      this.startSkillDiscovery(input.sessionId, entry);
+      if (input.history === "replay")
+        for (const { item, timestamp } of native.historyItems())
+          this.emit({
+            type: "timeline.item",
+            sessionId: input.sessionId,
+            item: entry.timeline.replay(item),
+            timestamp,
+          });
+      this.wireNativeEvents(input.sessionId, entry);
+      if (!this.sessions.has(input.sessionId))
+        throw new AdapterError(
+          "NATIVE_EXITED",
+          "ZCode disconnected during session open",
+        );
+      this.emitPendingPermissions(input.sessionId, native);
+      this.emit({
+        type: "session.ready",
+        requestId: input.requestId,
+        sessionId: input.sessionId,
+      });
+    } catch (error) {
+      this.sessions.delete(input.sessionId);
+      try {
+        await native.close();
+      } finally {
+        this.hosts.delete(host);
+        await host.close();
+      }
+      throw error;
+    }
+  }
+
+  /** Open or resume the native conversation behind a persistence handle.
+   *  Owns host/native cleanup on failure; the caller owns registry and
+   *  event-lifecycle concerns. */
+  private async attachNative(
+    persistence: PersistenceData,
+    config: ProviderSessionConfig,
+    nativeId: string | undefined,
+  ): Promise<AttachedNative> {
+    const cwd = persistence.cwd;
     const host = await this.host(config.env, cwd);
     let native: ZCodeSession | undefined;
     try {
@@ -629,28 +751,45 @@ export class ZCodeConnection implements ProviderConnection {
             ? { options: { reasoningLevel: config.thinkingOption } }
             : {}),
         }));
-      const snapshot = await host.request(
-        nativeId ? "resumeSession" : "createSession",
-        {
-          workspacePath: cwd,
-          ...(nativeId
-            ? { sessionId: nativeId }
-            : {
-                persistence: "deferred",
-                // session/create converts model to provider/model internally;
-                // the native create contract takes the reasoning level separately.
-                ...(initialModel
-                  ? {
-                      model: initialModel,
-                      thoughtLevel: initialModel.options?.reasoningLevel,
-                    }
-                  : {}),
-              }),
-          mcpServers: mapMcpServers(withZcodeConfigMcpServers(config.mcpServers)),
-        },
-        SessionSnapshotSchema,
-        60000,
-      );
+      const settings = settingsSchema.parse(config.settings);
+      let snapshot: z.output<typeof SessionSnapshotSchema>;
+      try {
+        snapshot = await host.request(
+          nativeId ? "resumeSession" : "createSession",
+          {
+            workspacePath: cwd,
+            ...(nativeId
+              ? { sessionId: nativeId }
+              : {
+                  persistence: "deferred",
+                  // session/create converts model to provider/model internally;
+                  // the native create contract takes the reasoning level separately.
+                  ...(initialModel
+                    ? {
+                        model: initialModel,
+                        thoughtLevel: initialModel.options?.reasoningLevel,
+                      }
+                    : {}),
+                }),
+            mcpServers: mapMcpServers(
+              withZcodeConfigMcpServers(config.mcpServers),
+            ),
+          },
+          SessionSnapshotSchema,
+          60000,
+        );
+      } catch (error) {
+        // Distinguish "the runtime no longer knows this native session" from
+        // every other failure: only the former may trigger the heal fallback
+        // (ADR-0020); spawn/workspace/transport errors must surface as-is.
+        if (nativeId === undefined) throw error;
+        throw new AdapterError(
+          "SESSION_NOT_FOUND",
+          `ZCode could not resume native session ${nativeId}`,
+          {},
+          { cause: error },
+        );
+      }
       if (nativeId && snapshot.session.sessionId !== nativeId)
         throw new Error("ZCode resumed a different session");
       native = await ZCodeSession.create({
@@ -686,76 +825,8 @@ export class ZCodeConnection implements ProviderConnection {
             : {}),
         },
       });
-      if (this.closed) throw new Error("ZCode connection is closed");
-      const entry: SessionEntry = {
-        native,
-        persistence,
-        submitted: nativeId !== undefined,
-        bridge: host,
-        unsubscribe() {},
-        unsubscribeFailure() {},
-        timeline: new TimelineSnapshots(),
-        messages: new Map(),
-        inputGeneration: 0,
-        queue: Promise.resolve(),
-        cwd,
-        goalModeBlocked: false,
-        skills: [],
-      };
-      this.sessions.set(input.sessionId, entry);
-      this.emit({
-        type: "session.opened",
-        requestId: input.requestId,
-        sessionId: input.sessionId,
-        capabilities: this.capabilities,
-        restoration: "core",
-        persistence: persistenceHandle(persistence),
-        cwd,
-        title: config.title ?? snapshot.session.title,
-      });
-      this.emitConfig(input.sessionId, entry);
-      // Skills load async: refresh the command list once discovery lands.
-      void listSkillCommands(cwd).then(
-        (skills) => {
-          if (this.sessions.get(input.sessionId) !== entry || !skills.length)
-            return;
-          entry.skills = skills;
-          this.emitConfig(input.sessionId, entry);
-        },
-        () => {},
-      );
-      if (input.history === "replay")
-        for (const { item, timestamp } of native.historyItems())
-          this.emit({
-            type: "timeline.item",
-            sessionId: input.sessionId,
-            item: entry.timeline.replay(item),
-            timestamp,
-          });
-      entry.unsubscribe = native.subscribe((event) =>
-        this.accept(input.sessionId, entry, event),
-      );
-      entry.unsubscribeFailure = host.onFailure((error) =>
-        native!.runtimeFailed(error),
-      );
-      if (!this.sessions.has(input.sessionId))
-        throw new AdapterError(
-          "NATIVE_EXITED",
-          "ZCode disconnected during session open",
-        );
-      for (const request of native.getPendingPermissions())
-        this.emit({
-          type: "session.permission",
-          sessionId: input.sessionId,
-          request,
-        });
-      this.emit({
-        type: "session.ready",
-        requestId: input.requestId,
-        sessionId: input.sessionId,
-      });
+      return { host, native, snapshot };
     } catch (error) {
-      this.sessions.delete(input.sessionId);
       try {
         await native?.close();
       } finally {
@@ -764,6 +835,162 @@ export class ZCodeConnection implements ProviderConnection {
       }
       throw error;
     }
+  }
+
+  private registerSession(
+    sessionId: string,
+    parts: {
+      native: ZCodeSession;
+      host: HostBridge;
+      persistence: PersistenceData;
+      cwd: string;
+      submitted: boolean;
+    },
+  ): SessionEntry {
+    const entry: SessionEntry = {
+      native: parts.native,
+      persistence: parts.persistence,
+      submitted: parts.submitted,
+      bridge: parts.host,
+      unsubscribe() {},
+      unsubscribeFailure() {},
+      timeline: new TimelineSnapshots(),
+      messages: new Map(),
+      inputGeneration: 0,
+      queue: Promise.resolve(),
+      cwd: parts.cwd,
+      goalModeBlocked: false,
+      skills: [],
+    };
+    this.sessions.set(sessionId, entry);
+    return entry;
+  }
+
+  /** Dispatch-miss self-heal: rebuild a session whose adapter process died,
+   *  from the resume index written at open. Returns false when no index
+   *  exists (never opened here, or properly closed) so the caller keeps the
+   *  historical SESSION_NOT_FOUND error. */
+  private healSession(sessionId: string): Promise<boolean> {
+    const inFlight = this.healing.get(sessionId);
+    if (inFlight) return inFlight;
+    const job = this.heal(sessionId).finally(() =>
+      this.healing.delete(sessionId),
+    );
+    this.healing.set(sessionId, job);
+    return job;
+  }
+
+  private async heal(sessionId: string): Promise<boolean> {
+    const index = await this.persistenceStore.loadIndex(sessionId);
+    if (!index) return false;
+    // Fail early — before any host spawn — when the workspace is gone, so the
+    // historical workspace error surfaces instead of a resume/fallback dance.
+    await resolveWorkspace(index.config.cwd);
+    // Model/thinking ride along so a fallback fresh session keeps the user's
+    // selection; settings/mode are intentionally NOT stored (ADR-0014: never
+    // infer or duplicate settings) — a resumed native session carries its own.
+    const config: ProviderSessionConfig = {
+      cwd: index.config.cwd,
+      env: index.config.env ?? {},
+      mcpServers: index.config.mcpServers as Record<
+        string,
+        ProviderMcpServerConfig
+      >,
+      settings: {},
+      persist: true,
+      providerOptions: {},
+      ...(index.config.model === undefined
+        ? {}
+        : { model: index.config.model }),
+      ...(index.config.thinkingOption === undefined
+        ? {}
+        : { thinkingOption: index.config.thinkingOption }),
+    };
+    const nativeId = await this.persistenceStore.resolve(index.handle);
+    let persistence = index.handle;
+    let parts: AttachedNative;
+    let fallbackFrom: string | undefined;
+    try {
+      parts = await this.attachNative(persistence, config, nativeId);
+    } catch (error) {
+      // Only a resume rejection may trigger the fresh-session fallback
+      // (ADR-0020). Spawn/workspace/transport errors surface as-is.
+      if (
+        nativeId === undefined ||
+        !(error instanceof AdapterError) ||
+        error.code !== "SESSION_NOT_FOUND"
+      )
+        throw error;
+      // The runtime no longer knows the native session (the tree died before
+      // ZCode checkpointed it). Continue on a fresh conversation instead of
+      // failing the dispatch; the old timeline stays viewable in Paseo.
+      fallbackFrom = nativeId;
+      persistence = {
+        kind: "logical",
+        id: randomUUID(),
+        cwd: index.config.cwd,
+      };
+      parts = await this.attachNative(persistence, config, undefined);
+      // Point the index at the replacement conversation so a SECOND process
+      // death resumes the fallback session instead of falling back again.
+      await this.persistenceStore.saveIndex(sessionId, {
+        version: 1,
+        handle: persistence,
+        config: index.config,
+      });
+    }
+    const entry = this.registerSession(sessionId, {
+      native: parts.native,
+      host: parts.host,
+      persistence,
+      cwd: index.config.cwd,
+      submitted: nativeId !== undefined && !fallbackFrom,
+    });
+    if (fallbackFrom)
+      this.emit({
+        type: "session.notice",
+        sessionId,
+        notice: {
+          id: `resume-fallback-${++healNoticeSeq}`,
+          severity: "warning",
+          title: "Resumed without prior context",
+          description: `ZCode could not restore native session ${fallbackFrom}; a new conversation was started. Earlier messages remain visible in the timeline.`,
+        },
+      });
+    this.emitConfig(sessionId, entry);
+    this.emitPendingPermissions(sessionId, parts.native);
+    this.wireNativeEvents(sessionId, entry);
+    this.startSkillDiscovery(sessionId, entry);
+    return true;
+  }
+
+  private wireNativeEvents(sessionId: string, entry: SessionEntry): void {
+    entry.unsubscribe = entry.native.subscribe((event) =>
+      this.accept(sessionId, entry, event),
+    );
+    entry.unsubscribeFailure = entry.bridge.onFailure((error) =>
+      entry.native.runtimeFailed(error),
+    );
+  }
+
+  private emitPendingPermissions(
+    sessionId: string,
+    native: ZCodeSession,
+  ): void {
+    for (const request of native.getPendingPermissions())
+      this.emit({ type: "session.permission", sessionId, request });
+  }
+
+  private startSkillDiscovery(sessionId: string, entry: SessionEntry): void {
+    // Skills load async: refresh the command list once discovery lands.
+    void listSkillCommands(entry.cwd).then(
+      (skills) => {
+        if (this.sessions.get(sessionId) !== entry || !skills.length) return;
+        entry.skills = skills;
+        this.emitConfig(sessionId, entry);
+      },
+      () => {},
+    );
   }
 
   private emitConfig(id: string, entry: SessionEntry): void {
@@ -832,8 +1059,7 @@ export class ZCodeConnection implements ProviderConnection {
     const clientMessageId = input.prompt.clientMessageId;
     // Control-command feedback renders as a synthetic assistant message (the
     // bridge did the same over ACP): notifications are not reliably persisted.
-    const note = (message: string): void =>
-      this.goalNote(sessionId, message);
+    const note = (message: string): void => this.goalNote(sessionId, message);
     // Completes a non-loop-start command: optional note + prompt_result.
     const complete = (message?: string): void => {
       if (message) note(message);
@@ -899,15 +1125,16 @@ export class ZCodeConnection implements ProviderConnection {
     switch (route.kind) {
       case "official-status": {
         const view = adapter.state();
-        complete(view ? formatGoalStatus(view) : `No ${label} loop for this session.`);
+        complete(
+          view ? formatGoalStatus(view) : `No ${label} loop for this session.`,
+        );
         return;
       }
       case "official-pause":
       case "official-resume":
       case "official-stop":
         try {
-          if (route.kind === "official-pause")
-            complete(await adapter.pause());
+          if (route.kind === "official-pause") complete(await adapter.pause());
           else if (route.kind === "official-resume")
             complete(await adapter.resume());
           else
@@ -925,19 +1152,25 @@ export class ZCodeConnection implements ProviderConnection {
         if (live) complete(live.statusText());
         else {
           const prior = readGoalState(entry.cwd, entry.native.id);
-          complete(prior ? statusTextOf(prior) : `No ${label} loop for this session.`);
+          complete(
+            prior ? statusTextOf(prior) : `No ${label} loop for this session.`,
+          );
         }
         return;
       case "driver-pause":
         if (live?.running) {
           live.pause();
-          complete(`${label} pause requested — takes effect at the round boundary`);
+          complete(
+            `${label} pause requested — takes effect at the round boundary`,
+          );
         } else complete(`No running ${label} loop to pause.`);
         return;
       case "driver-resume":
         if (live) {
           live.resume();
-          complete(`${label} resume — pause/stop flags cleared, loop continues`);
+          complete(
+            `${label} resume — pause/stop flags cleared, loop continues`,
+          );
           return;
         }
         try {
@@ -948,7 +1181,9 @@ export class ZCodeConnection implements ProviderConnection {
           );
           return;
         }
-        complete(`${label} loop resumed — running detached; rounds stream below.`);
+        complete(
+          `${label} loop resumed — running detached; rounds stream below.`,
+        );
         return;
       case "driver-stop":
         if (live?.running) {
@@ -1029,7 +1264,9 @@ export class ZCodeConnection implements ProviderConnection {
       runTurn: (prompt) => runDriverTurn(native, prompt),
       announce: (message) => this.goalNote(sessionId, message),
     };
-    const driver = GoalLoopDriver.start(host, objective, { resume: opts.resume });
+    const driver = GoalLoopDriver.start(host, objective, {
+      resume: opts.resume,
+    });
     this.goalLoops.set(native.id, driver);
   }
 
