@@ -245,10 +245,6 @@ it.each([
     override: { persist: false },
     message: "The verified ZCode host requires persistent sessions",
   },
-  {
-    override: { systemPrompt: "custom" },
-    message: expect.stringContaining("does not support custom system prompts"),
-  },
   // Schema failures carry no plugin-authored reason, so the text stays generic.
   {
     override: { providerOptions: { unknown: true } },
@@ -265,6 +261,64 @@ it.each([
     expect(f.host.calls).toEqual([]);
   },
 );
+it("folds a client system prompt into the first message only", async () => {
+  const f = await fixture();
+  await f.open({ systemPrompt: "custom instructions" });
+  await f.prompt();
+  await completeTurn(f.host);
+  await f.prompt("m2", "second");
+  await completeTurn(f.host);
+  const texts = f.host.calls
+    .filter((c) => c.params?.envelope?.type === "sendText")
+    .map((c) => c.params.envelope.payload.text);
+  expect(texts).toHaveLength(2);
+  expect(texts[0]).toContain("custom instructions");
+  expect(texts[0]).toContain("hello");
+  expect(texts[1]).toBe("second");
+});
+it("keeps a system prompt pending until the first real message", async () => {
+  const f = await fixture();
+  await f.open({ systemPrompt: "custom instructions" });
+  expect(await f.prompt("plan", "/plan")).toMatchObject({
+    result: { type: "completed" },
+  });
+  await f.prompt();
+  await completeTurn(f.host);
+  const texts = f.host.calls
+    .filter((c) => c.params?.envelope?.type === "sendText")
+    .map((c) => c.params.envelope.payload.text);
+  expect(texts).toHaveLength(1);
+  expect(texts[0]).toContain("custom instructions");
+  expect(texts[0]).toContain("hello");
+});
+it("does not fold a system prompt into a resumed native session", async () => {
+  const f = await fixture();
+  await f.open();
+  await f.prompt();
+  await completeTurn(f.host);
+  const index = (await f.store.loadIndex("public"))!;
+  await f.connection.close();
+  const peer = await freshPeer(f);
+  peer.host.afterAdmit = () => completeTurn(peer.host);
+  await peer.connection.send({
+    type: "session.open",
+    sessionId: "public",
+    requestId: "open",
+    config: { ...f.config, systemPrompt: "custom instructions" },
+    history: "replay",
+    persistence: { version: 3, data: index.handle },
+  });
+  await peer.wait(
+    (e) => e.type === "session.ready" || e.type === "request.failed",
+  );
+  await peer.prompt("m2");
+  await peer.wait((e) => e.type === "session.turn" && e.state === "completed");
+  const texts = peer.host.calls
+    .filter((c) => c.params?.envelope?.type === "sendText")
+    .map((c) => c.params.envelope.payload.text);
+  expect(texts).toHaveLength(1);
+  expect(texts[0]).not.toContain("custom instructions");
+});
 it("reports cumulative usage without adding repeated snapshots", async () => {
   const f = await fixture();
   await f.open();
