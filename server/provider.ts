@@ -23,7 +23,6 @@ import { homedir } from "node:os";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { z } from "zod";
-import type { ProviderMcpServerConfig } from "@getpaseo/plugin/server/provider";
 import {
   assertRuntimeSupported,
   discoverRuntime,
@@ -134,6 +133,7 @@ interface SessionEntry {
   native: ZCodeSession;
   persistence: PersistenceData;
   submitted: boolean;
+  pendingSystemPrompt?: string;
   bridge: HostBridge;
   unsubscribe: () => void;
   unsubscribeFailure: () => void;
@@ -590,8 +590,24 @@ export class ZCodeConnection implements ProviderConnection {
           });
           return;
         }
+        // A system prompt captured at open has no native slot: prepend it to
+        // the first real message. Commands and /plan shortcuts don't consume
+        // it, so the instructions still land on the first message after them.
+        const systemFold =
+          prompt.type === "message" && planTask === undefined
+            ? entry.pendingSystemPrompt
+            : undefined;
+        if (systemFold !== undefined) entry.pendingSystemPrompt = undefined;
         await entry.native.startTurn(
-          planTask ?? (prompt.type === "command" ? command! : prompt.content),
+          planTask ??
+            (prompt.type === "command"
+              ? command!
+              : systemFold !== undefined
+                ? [
+                    { type: "text", text: `${systemFold}\n\n---` },
+                    ...prompt.content,
+                  ]
+                : prompt.content),
           {
             clientMessageId: input.prompt.clientMessageId,
             delivery: input.prompt.delivery,
@@ -650,11 +666,11 @@ export class ZCodeConnection implements ProviderConnection {
     // The deprecated `settings` repeats the same values.
     const options = optionsSchema.parse(config.providerOptions ?? {});
     requireConfigurableMode(config.mode);
-    if (config.systemPrompt?.trim())
-      throw new AdapterError(
-        "INVALID_CONFIGURATION",
-        "ZCode does not support custom system prompts. Remove any added by Paseo's System prompt setting (Orchestration) or by another plugin.",
-      );
+    // ZCode has no system-prompt slot, but Paseo's Orchestration setting and
+    // plugin hosts (flowly) routinely attach one — rejecting the open makes
+    // such sessions impossible. Ride it along with the first message instead
+    // (see the session.prompt dispatch).
+    const systemPrompt = config.systemPrompt?.trim() || undefined;
     if (!config.persist)
       throw new AdapterError(
         "INVALID_CONFIGURATION",
@@ -683,6 +699,7 @@ export class ZCodeConnection implements ProviderConnection {
         persistence,
         cwd,
         submitted: nativeId !== undefined,
+        pendingSystemPrompt: nativeId === undefined ? systemPrompt : undefined,
       });
       // Paseo sets PASEO_AGENT_ID in the launch environment of every session.
       const agentId = config.env.PASEO_AGENT_ID;
@@ -846,6 +863,7 @@ export class ZCodeConnection implements ProviderConnection {
           "NATIVE_PROTOCOL_ERROR",
           "ZCode did not apply the requested initial model selection",
         );
+      const options = optionsSchema.parse(config.providerOptions ?? {});
       await native.applyInitialConfig({
         ...config,
         ...(nativeId
@@ -881,12 +899,14 @@ export class ZCodeConnection implements ProviderConnection {
       persistence: PersistenceData;
       cwd: string;
       submitted: boolean;
+      pendingSystemPrompt?: string;
     },
   ): SessionEntry {
     const entry: SessionEntry = {
       native: parts.native,
       persistence: parts.persistence,
       submitted: parts.submitted,
+      pendingSystemPrompt: parts.pendingSystemPrompt,
       bridge: parts.host,
       unsubscribe() {},
       unsubscribeFailure() {},
