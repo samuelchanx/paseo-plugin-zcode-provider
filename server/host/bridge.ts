@@ -1,6 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { once } from "node:events";
 import { existsSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
 import {
@@ -231,6 +232,10 @@ export class ZCodeHostBridge implements HostBridge {
         ...runtimeEnvironment(environment),
         ...windowsRuntimeHostEnvironment(runtime, environment),
         ...UNSUPPORTED_CAPABILITY_ENVIRONMENT,
+        // ZCode 4.0.0 hangs during handshake when ZCODE_DATA_BASE_DIR is unset
+        // while Desktop is running; pinning it to ~/.zcode resolves immediately.
+        ZCODE_DATA_BASE_DIR:
+          environment.ZCODE_DATA_BASE_DIR || join(homedir(), ".zcode"),
         // The Agent inherits this and reports it in model request headers, or
         // its CLI version without it. Desktop and the remote Core set it too.
         ZCODE_APP_VERSION: runtime.identity.appVersion,
