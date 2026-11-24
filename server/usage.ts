@@ -310,7 +310,7 @@ export function createUsageSource(
   };
 
   const source: UsageSourceRegistration = {
-    id: "zcode",
+    id: ZCODE_PROVIDER_ID,
     label: "ZCode",
     icon: "icon.svg",
     // Paseo 0.17.2 starts the card hidden on hosts where this provider is

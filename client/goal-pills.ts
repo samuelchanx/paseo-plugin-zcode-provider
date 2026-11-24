@@ -12,7 +12,7 @@ import {
 } from "../shared/goal";
 
 /** The provider ID the agents of this plugin carry. */
-const PROVIDER = "zcode";
+const PROVIDER = "zcode-native";
 /** How long to wait before following the goals again after a failure. */
 const RESUBSCRIBE_MS = 5_000;
 

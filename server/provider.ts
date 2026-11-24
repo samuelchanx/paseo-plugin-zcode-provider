@@ -20,7 +20,10 @@ import {
   type PersistenceData,
 } from "./persistence.js";
 import { homedir } from "node:os";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { z } from "zod";
+import type { ProviderMcpServerConfig } from "@getpaseo/plugin/server/provider";
 import {
   assertRuntimeSupported,
   discoverRuntime,
@@ -133,6 +136,50 @@ interface SessionEntry {
   forgetGoal: () => void;
 }
 
+// The protocol app-server loads no MCP stores on its own — servers only reach a
+// session through createSession params. Merge the user's CLI-configured servers
+// (~/.zcode/cli/config.json mcp.servers) so they apply without per-agent setup.
+type ZcodeConfigMcpEntry = {
+  type?: string;
+  command?: string;
+  args?: string[];
+  env?: Record<string, string>;
+  url?: string;
+  headers?: Record<string, string>;
+  enabled?: boolean;
+};
+
+function withZcodeConfigMcpServers(
+  servers: Record<string, ProviderMcpServerConfig> | undefined,
+): Record<string, ProviderMcpServerConfig> {
+  const merged: Record<string, ProviderMcpServerConfig> = { ...servers };
+  try {
+    const raw = JSON.parse(
+      readFileSync(join(homedir(), ".zcode", "cli", "config.json"), "utf8"),
+    ) as { mcp?: { servers?: Record<string, ZcodeConfigMcpEntry> } };
+    for (const [name, entry] of Object.entries(raw.mcp?.servers ?? {})) {
+      if (entry?.enabled === false || merged[name] !== undefined) continue;
+      if (typeof entry?.command === "string" && entry.command.trim() !== "") {
+        merged[name] = {
+          type: "stdio",
+          command: entry.command,
+          ...(entry.args ? { args: entry.args } : {}),
+          ...(entry.env ? { env: entry.env } : {}),
+        };
+      } else if (typeof entry?.url === "string" && entry.url.trim() !== "") {
+        merged[name] = {
+          type: "http",
+          url: entry.url,
+          ...(entry.headers ? { headers: entry.headers } : {}),
+        };
+      }
+    }
+  } catch {
+    // No readable CLI config: pass through Paseo-provided servers only.
+  }
+  return merged;
+}
+
 export function createZCodeProvider(
   bridgeFactory: BridgeFactory = createHost,
   persistenceStore = new SessionPersistenceStore(),
@@ -142,8 +189,8 @@ export function createZCodeProvider(
   installation?: ProviderRegistration["installation"],
 ): ProviderRegistration {
   return {
-    id: "zcode",
-    label: "ZCode",
+    id: "zcode-native",
+    label: "ZCode Native",
     description:
       "ZCode workspace agent with native planning, tools, and model selection",
     icon: "icon.svg",
@@ -621,7 +668,7 @@ export class ZCodeConnection implements ProviderConnection {
                   : {}),
               }),
           mcpServers: mapMcpServers(
-            config.mcpServers,
+            withZcodeConfigMcpServers(config.mcpServers),
             host.diagnostic.appVersion,
           ),
         },

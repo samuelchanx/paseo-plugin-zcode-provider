@@ -61,7 +61,7 @@ const failure = (cause: unknown) =>
 // after a manual refresh.
 function refreshCatalog(serverId: string): void {
   getPaseoClient(serverId)
-    .providers.refresh({ providers: ["zcode"] })
+    .providers.refresh({ providers: ["zcode-native"] })
     .catch(() => {});
 }
 

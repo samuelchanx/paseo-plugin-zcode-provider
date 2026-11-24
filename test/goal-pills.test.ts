@@ -13,7 +13,7 @@ const goal = (patch: Partial<GoalView> = {}): GoalView => ({
 });
 const agent = (
   id: string,
-  provider = "zcode",
+  provider = "zcode-native",
   workspaceId = "workspace-1",
 ) => ({
   id,
@@ -215,7 +215,7 @@ it("moves the pill with its agent and removes it with the agent", async () => {
     title: "Goal: Complete",
     icon: "CircleCheckBig",
   });
-  p.upsert(agent("agent-1", "zcode", "workspace-2"));
+  p.upsert(agent("agent-1", "zcode-native", "workspace-2"));
   expect([...p.pills.keys()]).toEqual(["workspace-2/agent-1"]);
   p.remove("agent-1");
   expect(p.pills.size).toBe(0);
