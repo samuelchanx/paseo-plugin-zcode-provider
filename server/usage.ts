@@ -234,6 +234,80 @@ function planAccess(state: AccountState, providerId?: string) {
   });
 }
 
+const API_KEY_QUOTA_URLS: Record<string, { family: AccountFamily; url: string }> = {
+  "bigmodel-api": {
+    family: "bigmodel",
+    url: "https://bigmodel.cn/api/monitor/usage/quota/limit",
+  },
+  "zai-api": {
+    family: "zai",
+    url: "https://api.z.ai/api/monitor/usage/quota/limit",
+  },
+};
+
+const apiKeyQuotaResponseSchema = z.object({
+  code: z.number().optional(),
+  success: z.boolean().optional(),
+  data: z
+    .object({
+      level: z.string().nullable().optional(),
+      limits: z.array(limitSchema),
+    })
+    .nullish(),
+});
+
+function codingPlanApiKeyProviders(view: NativeView) {
+  return view.providers.flatMap((provider) => {
+    const meta = API_KEY_QUOTA_URLS[provider.providerId];
+    const access = provider.effectiveConfig.access;
+    if (
+      !meta ||
+      provider.enabled === false ||
+      access?.type !== "zhipu-coding-plan-api-key" ||
+      typeof access.apiKey !== "string" ||
+      access.apiKey.trim().length === 0
+    )
+      return [];
+    return [
+      {
+        providerId: provider.providerId,
+        family: meta.family,
+        url: meta.url,
+        apiKey: access.apiKey.trim(),
+      },
+    ];
+  });
+}
+
+async function fetchApiKeyUsage(
+  url: string,
+  apiKey: string,
+): Promise<UsageReport> {
+  const response = await fetch(url, {
+    headers: { Authorization: `Bearer ${apiKey}` },
+    signal: AbortSignal.timeout(15_000),
+  });
+  if (response.status === 401 || response.status === 403)
+    return noQuota(`Coding Plan API key was rejected. Check ${SETTINGS_PATH}.`);
+  if (!response.ok)
+    return {
+      status: "error",
+      error: `Coding Plan usage request failed (HTTP ${response.status})`,
+    };
+  const parsed = apiKeyQuotaResponseSchema.safeParse(await response.json());
+  if (!parsed.success || !parsed.data.data)
+    return {
+      status: "error",
+      error: "ZCode could not read Coding Plan usage",
+    };
+  return usageReport({
+    quota: {
+      level: parsed.data.data.level ?? null,
+      limits: parsed.data.data.limits,
+    },
+  });
+}
+
 function accountKey(family: AccountFamily, userId: string | undefined) {
   if (!userId || userId === "unknown") return `${family}.individual`;
   // A stable, non-identifying key: the backend user ID is hashed.
@@ -271,25 +345,37 @@ export function createUsageSource(
 
   const discoverAccounts = async (): Promise<UsageAccount[]> => {
     const state = await account.use(readAccount);
-    if (state.session.status === "signed-out" || state.family === undefined)
-      return [];
-    const family = state.family;
-    const displayName =
-      state.session.status === "authenticated"
-        ? state.session.userInfo.displayName
-        : undefined;
-    const userId =
-      state.session.status === "authenticated"
-        ? state.session.userInfo.id
-        : undefined;
-    return planAccess(state).map(({ providerId }) => ({
-      key: accountKey(family, userId),
-      label: displayName
-        ? `${FAMILY_LABELS[family]} (${displayName})`
-        : FAMILY_LABELS[family],
-      harness: "ZCode",
-      input: { providerId } satisfies UsageInput,
-    }));
+    const result: UsageAccount[] = [];
+    if (state.session.status !== "signed-out" && state.family !== undefined) {
+      const family = state.family;
+      const displayName =
+        state.session.status === "authenticated"
+          ? state.session.userInfo.displayName
+          : undefined;
+      const userId =
+        state.session.status === "authenticated"
+          ? state.session.userInfo.id
+          : undefined;
+      for (const { providerId } of planAccess(state)) {
+        result.push({
+          key: accountKey(family, userId),
+          label: displayName
+            ? `${FAMILY_LABELS[family]} (${displayName})`
+            : FAMILY_LABELS[family],
+          harness: "ZCode",
+          input: { providerId } satisfies UsageInput,
+        });
+      }
+    }
+    for (const apiKeyPlan of codingPlanApiKeyProviders(state.view)) {
+      result.push({
+        key: `${apiKeyPlan.family}.api-key`,
+        label: `${FAMILY_LABELS[apiKeyPlan.family]} (API Key)`,
+        harness: "ZCode",
+        input: { providerId: apiKeyPlan.providerId } satisfies UsageInput,
+      });
+    }
+    return result;
   };
 
   const accounts = (): Promise<UsageAccount[]> => {
@@ -337,6 +423,11 @@ export function createUsageSource(
       try {
         return await account.use(async (host) => {
           const state = await readAccount(host);
+          const apiKeyPlan = codingPlanApiKeyProviders(state.view).find(
+            (entry) => entry.providerId === providerId,
+          );
+          if (apiKeyPlan)
+            return fetchApiKeyUsage(apiKeyPlan.url, apiKeyPlan.apiKey);
           if (state.session.status === "signed-out")
             return noQuota(`Signed out of ZCode. Open ${SETTINGS_PATH}.`);
           if (state.session.status === "reauthentication-required")

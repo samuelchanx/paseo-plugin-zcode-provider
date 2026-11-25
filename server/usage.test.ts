@@ -1,6 +1,6 @@
 import { UsageReportSchema } from "@getpaseo/protocol/messages";
 import { UsageScopeSchema } from "@getpaseo/plugin/server/usage";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { z } from "zod";
 import { AccountService, type SettingsHost } from "./account.js";
 import { AdapterError } from "./errors.js";
@@ -406,5 +406,73 @@ describe("usage source fetch", () => {
       status: "error",
       error: "Install it first.",
     });
+  });
+
+  it("discovers and fetches Coding Plan usage via bigmodel-api key when signed out", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          code: 200,
+          success: true,
+          data: {
+            level: "max",
+            limits: [
+              limit("TOKENS_LIMIT", 3, 5, 2),
+              limit("TOKENS_LIMIT", 6, 1, 38),
+              limit("TIME_LIMIT", 5, 1, 0),
+            ],
+          },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      const { host, usage } = fixture();
+      host.session = { status: "signed-out" };
+      host.family = null;
+      host.providers = [
+        {
+          providerId: "bigmodel-api",
+          enabled: true,
+          executable: true,
+          effectiveConfig: {
+            access: {
+              type: "zhipu-coding-plan-api-key",
+              apiKey: "test-bm-key",
+            },
+          },
+          issues: [],
+          models: [],
+        },
+      ];
+      const discovered = await usage.source.discover({ kind: "global" });
+      expect(discovered).toEqual([
+        {
+          key: "bigmodel.api-key",
+          label: "BigModel (API Key)",
+          harness: "ZCode",
+          input: { providerId: "bigmodel-api" },
+        },
+      ]);
+      const report = await usage.source.fetch({ providerId: "bigmodel-api" });
+      expect(UsageReportSchema.parse(report)).toMatchObject({
+        status: "available",
+        planLabel: "Max",
+        windows: [
+          { id: "five_hour", usedPct: 2, remainingPct: 98 },
+          { id: "weekly", usedPct: 38, remainingPct: 62 },
+          { id: "tool_calls", usedPct: 0, remainingPct: 100 },
+        ],
+      });
+      expect(fetchMock).toHaveBeenCalledWith(
+        "https://bigmodel.cn/api/monitor/usage/quota/limit",
+        expect.objectContaining({
+          headers: { Authorization: "Bearer test-bm-key" },
+        }),
+      );
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });
